@@ -326,3 +326,4 @@ export class SupabaseService {
 }
 
 export default new SupabaseService();
+

@@ -336,3 +336,4 @@ SELECT routine_name, routine_type
 FROM information_schema.routines
 WHERE routine_schema = 'public'
 AND routine_name IN ('get_user_api_key', 'check_usage_limit', 'reset_monthly_usage', 'get_user_usage_summary');
+

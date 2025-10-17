@@ -1,0 +1,246 @@
+name: Rotate OpenRouter Keys and Deploy
+
+# Schedule: Run monthly on the 1st at 2 AM UTC
+on:
+  schedule:
+    - cron: '0 2 1 * *'  # Monthly at 2 AM UTC on the 1st
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      delete_old_keys:
+        description: 'Delete old keys after rotation'
+        required: false
+        default: 'false'
+        type: boolean
+      target_environment:
+        description: 'Target environment for deployment'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - preview
+          - development
+
+jobs:
+  rotate-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+      
+      - name: Configure Vercel
+        run: |
+          echo "Configuring Vercel..."
+          vercel --version
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      
+      - name: Rotate OpenRouter Keys
+        env:
+          OPENROUTER_PROVISIONING_KEY: ${{ secrets.OPENROUTER_PROVISIONING_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENROUTER_AGENT_API_KEY: ${{ secrets.OPENROUTER_AGENT_API_KEY }}
+        run: |
+          echo "🔄 Starting OpenRouter key rotation..."
+          
+          # Create a simple rotation script
+          cat > rotate-keys.js << 'EOF'
+          import openRouterService from './src/services/OpenRouterService.js';
+          import supabaseService from './src/services/SupabaseService.js';
+          import { logger } from './src/utils/logger.js';
+          
+          async function rotateAllKeys() {
+            try {
+              console.log('📋 Fetching all users with API keys...');
+              const usersWithKeys = await supabaseService.getAllUsersWithKeys();
+              console.log(`Found ${usersWithKeys.length} users with keys`);
+              
+              const results = [];
+              const deleteOld = process.env.DELETE_OLD_KEYS === 'true';
+              
+              for (const userKey of usersWithKeys) {
+                try {
+                  console.log(`🔄 Rotating key for user ${userKey.user_id}...`);
+                  
+                  // Deactivate current key
+                  await supabaseService.deactivateUserApiKey(userKey.user_id);
+                  
+                  // Create new key
+                  const newOpenRouterKey = await openRouterService.createUserKey(
+                    userKey.user_id, 
+                    userKey.monthly_limit
+                  );
+                  
+                  // Store new key in Supabase
+                  await supabaseService.createUserApiKey(
+                    userKey.user_id,
+                    newOpenRouterKey.id,
+                    newOpenRouterKey.name,
+                    userKey.monthly_limit
+                  );
+                  
+                  // Optionally delete old key
+                  if (deleteOld) {
+                    try {
+                      await openRouterService.deleteKey(userKey.openrouter_key_id);
+                      console.log(`🗑️ Deleted old key for user ${userKey.user_id}`);
+                    } catch (error) {
+                      console.warn(`⚠️ Failed to delete old key for user ${userKey.user_id}:`, error.message);
+                    }
+                  }
+                  
+                  results.push({ userId: userKey.user_id, success: true });
+                  console.log(`✅ Successfully rotated key for user ${userKey.user_id}`);
+                  
+                } catch (error) {
+                  console.error(`❌ Failed to rotate key for user ${userKey.user_id}:`, error.message);
+                  results.push({ userId: userKey.user_id, success: false, error: error.message });
+                }
+              }
+              
+              const successCount = results.filter(r => r.success).length;
+              const failureCount = results.filter(r => !r.success).length;
+              
+              console.log(`\n📊 Rotation Summary:`);
+              console.log(`✅ Successful: ${successCount}`);
+              console.log(`❌ Failed: ${failureCount}`);
+              console.log(`📝 Total: ${results.length}`);
+              
+              if (failureCount > 0) {
+                console.log('\n❌ Failed rotations:');
+                results.filter(r => !r.success).forEach(r => {
+                  console.log(`  - User ${r.userId}: ${r.error}`);
+                });
+              }
+              
+              return results;
+              
+            } catch (error) {
+              console.error('💥 Rotation failed:', error);
+              throw error;
+            }
+          }
+          
+          // Run rotation
+          rotateAllKeys()
+            .then(() => {
+              console.log('🎉 Key rotation completed successfully!');
+              process.exit(0);
+            })
+            .catch((error) => {
+              console.error('💥 Key rotation failed:', error);
+              process.exit(1);
+            });
+          EOF
+          
+          # Run the rotation script
+          node rotate-keys.js
+        env:
+          DELETE_OLD_KEYS: ${{ github.event.inputs.delete_old_keys || 'false' }}
+      
+      - name: Deploy to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          echo "🚀 Deploying to Vercel..."
+          
+          # Set deployment environment
+          if [ "${{ github.event.inputs.target_environment }}" = "production" ]; then
+            vercel --prod --yes
+          elif [ "${{ github.event.inputs.target_environment }}" = "preview" ]; then
+            vercel --yes
+          else
+            vercel --yes
+          fi
+          
+          echo "✅ Deployment completed!"
+      
+      - name: Verify Deployment
+        run: |
+          echo "🔍 Verifying deployment..."
+          sleep 30  # Wait for deployment to stabilize
+          
+          # Get deployment URL (you'll need to set this in secrets)
+          DEPLOYMENT_URL="${{ secrets.VERCEL_DEPLOYMENT_URL }}"
+          
+          if [ -n "$DEPLOYMENT_URL" ]; then
+            echo "Testing health endpoint: $DEPLOYMENT_URL/health"
+            curl -f "$DEPLOYMENT_URL/health" || {
+              echo "❌ Health check failed"
+              exit 1
+            }
+            echo "✅ Health check passed"
+          else
+            echo "⚠️ No deployment URL configured, skipping verification"
+          fi
+      
+      - name: Send Notification
+        if: always()
+        run: |
+          echo "📢 Sending deployment notification..."
+          
+          # Create notification payload
+          if [ "${{ job.status }}" = "success" ]; then
+            STATUS="✅ Success"
+            COLOR="good"
+            MESSAGE="OpenRouter key rotation and deployment completed successfully!"
+          else
+            STATUS="❌ Failed"
+            COLOR="danger"
+            MESSAGE="OpenRouter key rotation and deployment failed!"
+          fi
+          
+          # Send to Slack if webhook is configured
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+              -H 'Content-type: application/json' \
+              --data "{
+                \"text\": \"🔑 OpenRouter Key Rotation Report\",
+                \"attachments\": [{
+                  \"color\": \"$COLOR\",
+                  \"fields\": [{
+                    \"title\": \"Status\",
+                    \"value\": \"$STATUS\",
+                    \"short\": true
+                  }, {
+                    \"title\": \"Environment\",
+                    \"value\": \"${{ github.event.inputs.target_environment || 'production' }}\",
+                    \"short\": true
+                  }, {
+                    \"title\": \"Triggered by\",
+                    \"value\": \"${{ github.actor }}\",
+                    \"short\": true
+                  }],
+                  \"footer\": \"OpenRouter Agent\",
+                  \"ts\": $(date +%s)
+                }]
+              }"
+          fi
+          
+          echo "📢 Notification sent"
+      
+      - name: Upload Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rotation-logs-${{ github.run_number }}
+          path: |
+            logs/
+            *.log
+          retention-days: 30

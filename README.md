@@ -234,3 +234,4 @@ MIT License - see LICENSE file for details
 - [Formul8 Multiagent](https://github.com/F8ai/formul8-multiagent) - Main multi-agent system
 - [F8 Security](https://github.com/F8ai/f8-security) - Security framework
 - [Supabase Integration](https://github.com/F8ai/supabase-integration) - Database integration
+
